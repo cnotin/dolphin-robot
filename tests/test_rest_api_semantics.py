@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime
+from types import SimpleNamespace
 
+from aiohttp import ClientResponseError
 import pytest
 
 from custom_components.mydolphin_plus.common.connectivity_status import (
@@ -128,6 +130,67 @@ class DummyConfigManager:
     async def update_aws_credentials_expiry(self, expiry: float):
         self.updated_aws_expiry = expiry
         self.aws_credentials_expiry = expiry
+
+
+class TokenStoringConfigManager(DummyConfigManager):
+    """Stores and clears tokens the way ConfigManager does."""
+
+    async def update_tokens(self, id_token, refresh_token, expires_at):
+        self.id_token = id_token
+        if refresh_token is not None:
+            self.refresh_token = refresh_token
+        self.id_token_expires_at = expires_at
+
+    async def reset_login_details(self):
+        self.id_token = None
+        self.refresh_token = None
+        self.id_token_expires_at = 0
+
+
+class StatusResponse(FakeResponse):
+    """Raises aiohttp's ClientResponseError on an error status, as aiohttp does."""
+
+    def raise_for_status(self):
+        if self.status >= 400:
+            raise ClientResponseError(
+                SimpleNamespace(real_url="https://example.invalid"),
+                (),
+                status=self.status,
+                message="error",
+            )
+
+
+class ScriptedSession:
+    """Answers `status` to the first `times` requests (every request when None), then 200.
+
+    Records each request's Authorization header, and refuses a sixth request so a
+    retry loop fails fast instead of recursing.
+    """
+
+    def __init__(self, status: int, times: int | None):
+        self.status = status
+        self.times = times
+        self.auth_headers: list[str | None] = []
+
+    def post(self, _url, headers=None, data=None):
+        self.auth_headers.append(headers.get("Authorization"))
+        if len(self.auth_headers) > 5:
+            raise RuntimeError("request loop")
+        failing = self.times is None or len(self.auth_headers) <= self.times
+        return StatusResponse(
+            {"Data": {"Sernum": "123"}}, status=self.status if failing else 200
+        )
+
+
+class TextResponse(FakeResponse):
+    """Response with a raw text body, such as an HTML error page."""
+
+    def __init__(self, body: str, status: int):
+        super().__init__({}, status=status)
+        self._body = body
+
+    async def text(self) -> str:
+        return self._body
 
 
 @pytest.mark.asyncio
@@ -287,7 +350,7 @@ async def test_rate_limited_with_expired_cache_sets_failed():
 @pytest.mark.asyncio
 async def test_cognito_refresh_transport_failure_retains_tokens(monkeypatch):
     """A transport failure must not be treated as a rejected refresh token."""
-    cfg = DummyConfigManager()
+    cfg = TokenStoringConfigManager()
     api = RestAPI(None, cfg)
     api._session = object()
     api.set_local_async_dispatcher_send(lambda *_args: None)
@@ -327,3 +390,162 @@ async def test_cognito_refresh_auth_failure_clears_tokens(monkeypatch):
     assert await api._ensure_id_token_valid() is False
     assert cleared["called"] is True
     assert api.status == ConnectivityStatus.EXPIRED_TOKEN
+
+
+@pytest.mark.asyncio
+async def test_invalidate_id_token_keeps_refresh_token():
+    """Invalidating the IdToken keeps the refresh token, so no new OTP is needed."""
+    manager = ConfigManager(None)
+    manager._data = {
+        STORAGE_DATA_ID_TOKEN: "id-token",
+        STORAGE_DATA_ID_TOKEN_EXPIRES_AT: 1234567890,
+        STORAGE_DATA_REFRESH_TOKEN: "refresh-token",
+    }
+    saved = {"called": False}
+
+    async def mark_saved():
+        saved["called"] = True
+
+    manager._save = mark_saved
+
+    await manager.invalidate_id_token()
+
+    assert manager.id_token is None
+    assert manager.id_token_expires_at == 0
+    assert manager.refresh_token == "refresh-token"
+    assert saved["called"] is True
+
+
+def _api_on_session(monkeypatch, status: int, times: int | None, refresh_error=None):
+    """RestAPI on a ScriptedSession, with the Cognito refresh stubbed and counted.
+
+    The stubbed refresh returns a new IdToken, or raises `refresh_error` when given.
+    """
+    cfg = TokenStoringConfigManager()
+    api = RestAPI(None, cfg)
+    api._session = ScriptedSession(status, times)
+    api.set_local_async_dispatcher_send(lambda *_args: None)
+    refreshes: list[str] = []
+
+    async def fake_refresh(_session, refresh_token, integration_info=None):
+        refreshes.append(refresh_token)
+        if refresh_error is not None:
+            raise refresh_error
+        return {"IdToken": f"new-id-token-{len(refreshes)}", "ExpiresIn": 3600}
+
+    monkeypatch.setattr(rest_api_module, "cognito_refresh", fake_refresh)
+    return api, cfg, refreshes
+
+
+@pytest.mark.asyncio
+async def test_http_401_refreshes_id_token_and_retries_once(monkeypatch):
+    """A 401 renews only the IdToken and repeats the request with the new one."""
+    api, cfg, refreshes = _api_on_session(monkeypatch, 401, times=1)
+
+    payload = await api._bearer_post("https://example.invalid")
+
+    assert payload == {"Data": {"Sernum": "123"}}
+    assert refreshes == ["refresh-token"]
+    assert api._session.auth_headers == ["Bearer id-token", "Bearer new-id-token-1"]
+    assert cfg.refresh_token == "refresh-token"
+
+
+@pytest.mark.asyncio
+async def test_http_401_retry_is_bounded(monkeypatch):
+    """A persistent 401 costs one refresh and one retry, then reports FAILED."""
+    api, cfg, refreshes = _api_on_session(monkeypatch, 401, times=None)
+
+    payload = await api._bearer_post("https://example.invalid")
+
+    assert payload is None
+    assert len(refreshes) == 1
+    assert len(api._session.auth_headers) == 2
+    assert api.status == ConnectivityStatus.FAILED
+    assert cfg.refresh_token == "refresh-token"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("refresh_error", "status", "refresh_token"),
+    [
+        (CognitoAuthError("rejected"), ConnectivityStatus.EXPIRED_TOKEN, None),
+        (
+            CognitoRequestError("DNS unavailable"),
+            ConnectivityStatus.FAILED,
+            "refresh-token",
+        ),
+    ],
+    ids=["refresh-rejected", "refresh-unreachable"],
+)
+async def test_http_401_with_failed_refresh_is_not_retried(
+    monkeypatch, refresh_error, status, refresh_token
+):
+    """When the refresh after a 401 fails, the request is not repeated.
+
+    Only a rejected refresh token clears the login; an unreachable Cognito keeps it.
+    """
+    api, cfg, refreshes = _api_on_session(
+        monkeypatch, 401, times=None, refresh_error=refresh_error
+    )
+
+    payload = await api._bearer_post("https://example.invalid")
+
+    assert payload is None
+    assert len(refreshes) == 1
+    assert len(api._session.auth_headers) == 1
+    assert api.status == status
+    assert cfg.refresh_token == refresh_token
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("http_status", "status"),
+    [(500, ConnectivityStatus.FAILED), (404, ConnectivityStatus.API_NOT_FOUND)],
+    ids=["http-500", "http-404"],
+)
+async def test_http_error_other_than_401_is_not_refreshed(
+    monkeypatch, http_status, status
+):
+    """Only a 401 triggers the refresh-and-retry; other errors just set the status."""
+    api, cfg, refreshes = _api_on_session(monkeypatch, http_status, times=None)
+
+    payload = await api._bearer_post("https://example.invalid")
+
+    assert payload is None
+    assert refreshes == []
+    assert len(api._session.auth_headers) == 1
+    assert api.status == status
+    assert cfg.refresh_token == "refresh-token"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        (
+            400,
+            '{"__type": "com.amazonaws.cognito#NotAuthorizedException"}',
+            CognitoAuthError,
+        ),
+        (400, '{"__type": "TooManyRequestsException"}', CognitoRequestError),
+        (500, '{"__type": "InternalErrorException"}', CognitoRequestError),
+        (502, "<html>502 Bad Gateway</html>", CognitoRequestError),
+    ],
+    ids=["namespaced-not-authorized", "throttled", "server-error", "html-error-page"],
+)
+async def test_cognito_error_classification(status, body, expected):
+    """Only NotAuthorizedException, namespaced or not, is an auth rejection."""
+
+    class ErrorSession:
+        def post(self, *_args, **_kwargs):
+            return TextResponse(body, status)
+
+    # Match the message too, so each case is proven to take its own branch rather
+    # than the generic "request failed" handler.
+    message = (
+        "rejected authentication"
+        if expected is CognitoAuthError
+        else f"returned {status}"
+    )
+    with pytest.raises(expected, match=message):
+        await _cognito_call(ErrorSession(), "InitiateAuth", {})
